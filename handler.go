@@ -230,6 +230,96 @@ func (h *Handler) CancelBooking(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "booking cancelled, slot released"})
 }
 
+func (h *Handler) RescheduleBooking(c *gin.Context) {
+	id := c.Param("id")
+
+	var input struct {
+		NewTimeSlotID uint `json:"new_time_slot_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var booking Booking
+	if err := h.db.Preload("TimeSlot").First(&booking, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "booking not found"})
+		return
+	}
+
+	if booking.Status != "confirmed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "only confirmed bookings can be rescheduled"})
+		return
+	}
+
+	if booking.TimeSlotID == input.NewTimeSlotID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new time slot is the same as current"})
+		return
+	}
+
+	var newSlot TimeSlot
+	if err := h.db.Preload("Trainer").First(&newSlot, input.NewTimeSlotID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "new time slot not found"})
+		return
+	}
+
+	if newSlot.Status != "available" {
+		c.JSON(http.StatusConflict, gin.H{"error": "new time slot is not available"})
+		return
+	}
+
+	if newSlot.CurrentBookingCount >= newSlot.Capacity {
+		c.JSON(http.StatusConflict, gin.H{"error": "new time slot is full"})
+		return
+	}
+
+	tx := h.db.Begin()
+
+	oldSlotID := booking.TimeSlotID
+	oldSlotCurrentCount := booking.TimeSlot.CurrentBookingCount
+
+	newOldCount := oldSlotCurrentCount - 1
+	if newOldCount < 0 {
+		newOldCount = 0
+	}
+	if err := tx.Model(&TimeSlot{}).Where("id = ?", oldSlotID).
+		Updates(map[string]interface{}{
+			"current_booking_count": newOldCount,
+			"status":                "available",
+		}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	newSlotNewCount := newSlot.CurrentBookingCount + 1
+	if err := tx.Model(&newSlot).Update("current_booking_count", newSlotNewCount).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if newSlotNewCount >= newSlot.Capacity {
+		if err := tx.Model(&newSlot).Update("status", "full").Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	if err := tx.Model(&Booking{}).Where("id = ?", booking.ID).
+		Update("time_slot_id", input.NewTimeSlotID).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	tx.Commit()
+
+	h.db.Preload("TimeSlot.Trainer").First(&booking, booking.ID)
+	c.JSON(http.StatusOK, booking)
+}
+
 func (h *Handler) ListBookings(c *gin.Context) {
 	var bookings []Booking
 

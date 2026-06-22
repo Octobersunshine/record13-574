@@ -24,6 +24,7 @@ func SetupRouter(h *Handler) *gin.Engine {
 		api.POST("/bookings", h.CreateBooking)
 		api.GET("/bookings", h.ListBookings)
 		api.DELETE("/bookings/:id", h.CancelBooking)
+		api.PUT("/bookings/:id/reschedule", h.RescheduleBooking)
 	}
 
 	return r
