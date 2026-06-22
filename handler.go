@@ -52,10 +52,15 @@ func (h *Handler) CreateSlot(c *gin.Context) {
 		TrainerID uint      `json:"trainer_id" binding:"required"`
 		StartTime time.Time `json:"start_time" binding:"required"`
 		EndTime   time.Time `json:"end_time" binding:"required"`
+		Capacity  int       `json:"capacity" binding:"min=1"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	if input.Capacity <= 0 {
+		input.Capacity = 1
 	}
 
 	if !input.EndTime.After(input.StartTime) {
@@ -71,8 +76,8 @@ func (h *Handler) CreateSlot(c *gin.Context) {
 
 	var conflictCount int64
 	h.db.Model(&TimeSlot{}).
-		Where("trainer_id = ? AND status = ? AND start_time < ? AND end_time > ?",
-			input.TrainerID, "available", input.EndTime, input.StartTime).
+		Where("trainer_id = ? AND start_time < ? AND end_time > ?",
+			input.TrainerID, input.EndTime, input.StartTime).
 		Count(&conflictCount)
 	if conflictCount > 0 {
 		c.JSON(http.StatusConflict, gin.H{"error": "time slot conflicts with existing slots"})
@@ -83,6 +88,7 @@ func (h *Handler) CreateSlot(c *gin.Context) {
 		TrainerID: input.TrainerID,
 		StartTime: input.StartTime,
 		EndTime:   input.EndTime,
+		Capacity:  input.Capacity,
 		Status:    "available",
 	}
 	if err := h.db.Create(&slot).Error; err != nil {
@@ -143,12 +149,26 @@ func (h *Handler) CreateBooking(c *gin.Context) {
 		return
 	}
 
+	if slot.CurrentBookingCount >= slot.Capacity {
+		c.JSON(http.StatusConflict, gin.H{"error": "time slot is full"})
+		return
+	}
+
 	tx := h.db.Begin()
 
-	if err := tx.Model(&slot).Update("status", "booked").Error; err != nil {
+	newCount := slot.CurrentBookingCount + 1
+	if err := tx.Model(&slot).Update("current_booking_count", newCount).Error; err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
+	}
+
+	if newCount >= slot.Capacity {
+		if err := tx.Model(&slot).Update("status", "full").Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
 	}
 
 	booking := Booking{
@@ -191,7 +211,15 @@ func (h *Handler) CancelBooking(c *gin.Context) {
 		return
 	}
 
-	if err := tx.Model(&TimeSlot{}).Where("id = ?", booking.TimeSlotID).Update("status", "available").Error; err != nil {
+	newCount := booking.TimeSlot.CurrentBookingCount - 1
+	if newCount < 0 {
+		newCount = 0
+	}
+	if err := tx.Model(&TimeSlot{}).Where("id = ?", booking.TimeSlotID).
+		Updates(map[string]interface{}{
+			"current_booking_count": newCount,
+			"status":                "available",
+		}).Error; err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
